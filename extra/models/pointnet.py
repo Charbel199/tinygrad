@@ -85,19 +85,21 @@ class TNet:
         self.k  = k
         self.id = Tensor.eye(k).reshape(1, k*k)
         self.fc1, self.bn1 = Linear(k, 64),   BatchNorm1D(64)
-        self.fc2, self.bn2 = Linear(64,128),  BatchNorm1D(128)
-        self.fc3, self.bn3 = Linear(128,1024),BatchNorm1D(1024)
-        self.fc4, self.bn4 = Linear(1024,512),BatchNorm1D(512)
-        self.fc5, self.bn5 = Linear(512,256), BatchNorm1D(256)
-        self.fc6 = Linear(256,k*k)
+        self.fc2, self.bn2 = Linear(64, 64),   BatchNorm1D(64)
+        self.fc3, self.bn3 = Linear(64,128),  BatchNorm1D(128)
+        self.fc4, self.bn4 = Linear(128,1024),BatchNorm1D(1024)
+        self.fc5, self.bn5 = Linear(1024,512),BatchNorm1D(512)
+        self.fc6, self.bn6 = Linear(512,256), BatchNorm1D(256)
+        self.fc7 = Linear(256,k*k)
     def __call__(self, x: Tensor) -> Tensor:
         x = self.bn1(self.fc1(x)).relu()
         x = self.bn2(self.fc2(x)).relu()
         x = self.bn3(self.fc3(x)).relu()
-        x = x.max(1)
         x = self.bn4(self.fc4(x)).relu()
+        x = x.max(1)
         x = self.bn5(self.fc5(x)).relu()
-        return self.fc6(x) + self.id
+        x = self.bn6(self.fc6(x)).relu()
+        return self.fc7(x) + self.id
 
 class PointNet:
     def __init__(self, n_cls: int = 40):
@@ -206,9 +208,12 @@ class ModelNet40:
         with open(path, "r") as f:
             v,f_ = read_off(f)
         
-        # Sample and noramlize
-        pc = normalize(self.sampler((v,f_)))
-        #show_pointcloud(pc)
+        try:
+            # Sample and noramlize
+            pc = normalize(self.sampler((v,f_)))
+            #show_pointcloud(pc)
+        except Exception as e:
+            print(f"Exception: {str(e)} on pointcloud {path}")
 
         # Apply random rotation
         if self.split == "train":
@@ -255,8 +260,6 @@ def train(epochs: int = 20, batch: int = 4, lr: float = 1e-3, seed: int = 0):
                               unit="batch", leave=False)
 
             for i in pbar_train:
-                if i == 100:
-                    break
                 xb, yb = zip(*(train_ds[j] for j in order[i:i + batch]))
                 loss = _train_step(
                     model, opt,
