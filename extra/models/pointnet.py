@@ -71,7 +71,8 @@ def download_modelnet40() -> Path:
 
 ######## PointNet Model ########
 class BatchNorm1D:
-    def __init__(self, c: int): self.bn = BatchNorm2d(c)
+    def __init__(self, c: int, momentum=0.5):
+        self.bn = BatchNorm2d(c, momentum=momentum)
     def __call__(self, x: Tensor) -> Tensor:
         # x is originally (B, N, C)
         if x.ndim == 2:
@@ -85,21 +86,21 @@ class TNet:
         self.k  = k
         self.id = Tensor.eye(k).reshape(1, k*k)
         self.fc1, self.bn1 = Linear(k, 64),   BatchNorm1D(64)
-        self.fc2, self.bn2 = Linear(64, 64),   BatchNorm1D(64)
-        self.fc3, self.bn3 = Linear(64,128),  BatchNorm1D(128)
-        self.fc4, self.bn4 = Linear(128,1024),BatchNorm1D(1024)
-        self.fc5, self.bn5 = Linear(1024,512),BatchNorm1D(512)
-        self.fc6, self.bn6 = Linear(512,256), BatchNorm1D(256)
-        self.fc7 = Linear(256,k*k)
+        self.fc2, self.bn2 = Linear(64,128),  BatchNorm1D(128)
+        self.fc3, self.bn3 = Linear(128,1024),BatchNorm1D(1024)
+        self.fc4, self.bn4 = Linear(1024,512),BatchNorm1D(512)
+        self.fc5, self.bn5 = Linear(512,256), BatchNorm1D(256)
+        self.fc6 = Linear(256,k*k)
     def __call__(self, x: Tensor) -> Tensor:
         x = self.bn1(self.fc1(x)).relu()
         x = self.bn2(self.fc2(x)).relu()
         x = self.bn3(self.fc3(x)).relu()
-        x = self.bn4(self.fc4(x)).relu()
         x = x.max(1)
+        x = self.bn4(self.fc4(x)).relu()
         x = self.bn5(self.fc5(x)).relu()
-        x = self.bn6(self.fc6(x)).relu()
-        return self.fc7(x) + self.id
+        out = self.fc6(x) + self.id 
+        self.last_T = out.reshape(x.shape[0], self.k, self.k)
+        return self.last_T
 
 class PointNet:
     def __init__(self, n_cls: int = 40):
@@ -113,14 +114,15 @@ class PointNet:
         self.h3 = Linear(256,n_cls)
     def __call__(self, x: Tensor) -> Tensor:
         B, N, _ = x.shape
-        x = x @ self.input_tnet(x).reshape(B,3,3)
+        x = x @ self.input_tnet(x)
         x = self.bn1(self.fc1(x)).relu()
-        x = x @ self.feature_tnet(x).reshape(B,64,64)
+        x = x @ self.feature_tnet(x)
         x = self.bn2(self.fc2(x)).relu()
         x = self.bn3(self.fc3(x)).relu()
         x = x.max(1)
         x = self.hbn1(self.h1(x)).relu()
         x = self.hbn2(self.h2(x)).relu()
+        x = x.dropout(p=0.3)
         return self.h3(x)
 
 
@@ -228,11 +230,38 @@ class ModelNet40:
         return pc, y
 
 ######## Train/Test ########
+
+def orthogonal_regularizer(mat: Tensor) -> Tensor:
+    """
+    || A · Aᵀ – I ||²_F   for a batch of square matrices.
+    mat expected shape: (B, k, k)
+    """
+    k = mat.shape[-1]
+    I = Tensor.eye(k, dtype=mat.dtype).reshape(1, k, k)
+    return ((mat @ mat.permute(0, 2, 1) - I)**2).sum()
+
+def adjust_bn_momentum(model, epoch):
+    new_mom = min(0.99, 0.5 + 0.02*epoch)   # simple linear ramp
+    for mod in model.__dict__.values():
+        if isinstance(mod, BatchNorm1D):
+            mod.bn.momentum = new_mom
+
 @Tensor.train()
 @TinyJit
 def _train_step(model, opt, xb, yb):
     opt.zero_grad()
-    loss = model(xb).sparse_categorical_crossentropy(yb).mean().backward()
+
+    logits = model(xb)
+    clf_loss = logits.sparse_categorical_crossentropy(yb).mean()
+
+    # grab both transform matrices that were saved during the forward pass
+    reg_loss = (
+          orthogonal_regularizer(model.input_tnet.last_T) +
+          orthogonal_regularizer(model.feature_tnet.last_T)
+    ) * 0.001          # paper’s λ
+
+    loss = clf_loss + reg_loss
+    loss.backward()
     return loss.realize(*opt.schedule_step())
 
 @TinyJit
@@ -241,12 +270,15 @@ def _test_batch(model, xb):
 
 
 
-def train(epochs: int = 20, batch: int = 4, lr: float = 1e-3, seed: int = 0):
+def train(epochs: int = 20, batch: int = 32, lr: float = 1e-3, seed: int = 0):
     random.seed(seed); np.random.seed(seed)
 
     train_ds, test_ds = ModelNet40("train"), ModelNet40("test")
     model = PointNet()
-    opt   = Adam(get_parameters(model), lr=lr)
+    opt = Adam(get_parameters(model), lr=lr, b1=0.9, b2=0.999)
+
+    def adjust_lr(opt, epoch, base_lr=1e-3):
+        opt.lr = base_lr * (0.5 ** (epoch // 20))
 
     history = {"loss": [], "acc": []}
 
@@ -282,6 +314,11 @@ def train(epochs: int = 20, batch: int = 4, lr: float = 1e-3, seed: int = 0):
             correct += int((preds == np.array(yb)).sum())
             pbar_eval.set_postfix(progress=f"{i + batch}/{len(test_ds)}")
 
+        # Increase momentum
+        adjust_bn_momentum(model, ep)
+        # Adjust lr
+        adjust_lr(opt, ep - 1, 1e-3)
+        
         acc = correct / len(test_ds)
         history["acc"].append(acc)
         print(f"epoch {ep:02} | loss {history['loss'][-1]:.4f} | acc {acc:.3%}")
